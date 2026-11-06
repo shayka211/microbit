@@ -3,6 +3,16 @@ name = "authenticate"
 version = "0.1.0"
 authors = ["Henrik Böving <hargonix@gmail.com>"]
 edition = "2018"
+description = "micro:bit v2 challenge-response authenticator firmware + reusable protocol/crypto library"
+
+[lib]
+name = "authenticate"
+path = "src/lib.rs"
+
+[[bin]]
+name = "authenticate"
+path = "src/main.rs"
+required-features = ["v2"]
 
 [dependencies.microbit-v2]
 version = "0.12.0"
@@ -12,26 +22,44 @@ optional = true
 version = "0.12.0"
 optional = true
 
+# Library-only dependencies: anything here is host-compilable and is what the
+# reusable protocol/crypto code (and the host tool) depends on.
 [dependencies]
-cortex-m = "0.7.3"
-cortex-m-rt = "0.7.0"
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+heapless = "0.8"
+
+# Firmware-only dependencies. Scoped to the embedded target so that
+# `cargo test --lib` runs the pure-logic tests on the host.
+[target.thumbv7em-none-eabihf.dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core", "inline-asm"] }
+cortex-m-rt = "0.7.3"
+nrf52833-pac = "0.12"
 embassy-executor = { version = "0.5.0", features = ["arch-cortex-m", "executor-thread", "defmt", "integrated-timers"] }
 embassy-nrf = { version = "0.1.0", features = ["nrf52833", "defmt", "time-driver-rtc1", "gpiote"] }
+embassy-sync = "0.5.0"
 embassy-time = { version = "0.3.0", features = ["defmt", "defmt-timestamp-uptime"] }
-defmt = "1.2.0"
-defmt-rtt = "1.3.1"
-panic-halt = "0.2.0"
-panic-probe = { version = "1.0.0", features = ["print-defmt"] }
-#rtt-target = { version = "0.3.1", features = ["cortex-m"] }
-#panic-rtt-target = { version = "0.1.2", features = ["cortex-m"] }
+embassy-futures = "0.1"
+defmt = "0.3"
+defmt-rtt = "0.4"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
 
-[dev-dependencies]
-# Sneak in dependencies for examples which clash with panic-hal when generating
-# docs with rustdoc.
-rtt-target = { version = "0.3.1", features = ["cortex-m"] }
-panic-rtt-target = { version = "0.1.2", features = ["cortex-m"] }
+# On-target (defmt-test) test harness, only ever built for the embedded target.
+[target.thumbv7em-none-eabihf.dev-dependencies]
+defmt-test = "0.3"
+# The test binary has no HAL to provide a vector table for cortex-m-rt;
+# pull in the device crate directly (with `rt`) and reference it from the test.
+nrf52833-pac = { version = "0.12", features = ["rt"] }
+
+[[test]]
+name = "ondevice"
+path = "tests/ondevice.rs"
+harness = false
 
 [features]
+# NOTE: the old `uart-log` feature was removed on purpose: UARTE0 is owned by
+# the auth protocol and can no longer double as a log mirror. Logs go to
+# defmt/RTT (open the probe-rs RTT pane or run `probe-rs run`).
 default = ["v2"]
 v2 = ["microbit-v2"]
 v1 = ["microbit"]

@@ -1,4 +1,14 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 rustflags = [
   "-C", "link-arg=-Tlink.x",
+  # defmt.x collects all the `.defmt.*` sections into the single `.defmt`
+  # section that probe-rs needs to decode the log messages. Without it the
+  # firmware runs fine but *no* defmt output is visible (probe-rs reports
+  # "no .defmt section") — that's why logs appear missing after flashing.
+  "-C", "link-arg=-Tdefmt.x",
 ]
+
+# On-target tests (defmt-test): `cargo test --target thumbv7em-none-eabihf --test ondevice`
+# flashes the test binary with probe-rs and runs it on the real M4.
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip nRF52833_xxAA"

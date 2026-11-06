@@ -4,6 +4,28 @@
         {
             "type": "probe-rs-debug",
             "request": "launch",
+            "name": "authenticate",
+            "cwd": "${workspaceFolder}",
+            "chip": "nRF52833_xxAA",
+            "flashingConfig": {
+                "flashingEnabled": true,
+                "resetAfterFlashing": true,
+                // While halted at reset the firmware has not run yet, so the RTT
+                // control block is not initialized and probe-rs fails to attach
+                // RTT ("Failed to attach to RTT: Timeout"). Let it run instead;
+                // you can still pause with the debugger.
+                "haltAfterReset": false
+            },
+            "coreConfigs": [
+                {
+                    "coreIndex": 0,
+                    "programBinary": "${workspaceFolder}/target/thumbv7em-none-eabihf/debug/authenticate"
+                }
+            ]
+        },
+        {
+            "type": "probe-rs-debug",
+            "request": "launch",
             "name": "uart - exercise 7",
             "cwd": "${workspaceFolder}",
             "chip": "nRF52833_xxAA",

@@ -1,0 +1,24 @@
+[package]
+name = "microbit-authenticator"
+version = "0.1.0"
+edition = "2021"
+description = "Host side of the micro:bit challenge-response login (PAM-compatible)"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "microbit-authenticator"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+authenticate = { path = "../../src/12-authenticate", default-features = false }
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+rand = "0.8"
+serialport = "4"
+
+# Standalone workspace so this host-side (std) crate is independent of the
+# embedded workspace at the repo root. Host tools need the host target while
+# the firmware needs thumbv7em-none-eabihf, and rust-analyzer can only use one
+# target per workspace, so they must be separate workspaces.
+[workspace]

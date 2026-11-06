@@ -1,0 +1,4 @@
+auth sufficient pam_exec.so quiet log=/var/log/microbit-auth.log /usr/local/bin/microbit-authenticator auth
+# ^ insert at the TOP of the `auth` section in /etc/pam.d/sddm (and /etc/pam.d/kde
+#   for the KDE lock screen). `sufficient` = success → log in immediately;
+#   failure → fall through to the normal password prompt.

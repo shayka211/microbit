@@ -1,0 +1,14 @@
+{
+    // The whole repo root is the embedded micro:bit workspace: all firmware
+    // crates (and the firmware of 12-authenticate) only link against
+    // thumbv7em-none-eabihf dependencies (see [target.*] in each Cargo.toml).
+    // Analyze everything with the embedded target or rust-analyzer will report
+    // "cannot find crate `embassy_nrf` / `embassy_sync`".
+    "rust-analyzer.cargo.target": "thumbv7em-none-eabihf",
+    // Don't run `cargo check --all-targets`: checking the test harness against
+    // the embedded target fails with "can't find crate for `test`".
+    "rust-analyzer.check.allTargets": false,
+    // Needed so build.rs (e.g. memory.x -> link.x) and proc-macros like
+    // embassy_executor::main are resolved correctly.
+    "rust-analyzer.cargo.buildScripts.enable": true,
+}

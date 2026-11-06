@@ -1,0 +1,3 @@
+# micro:bit (DAPLink CDC-ACM) as a stable serial device for the authenticator.
+# Verify VID/PID with `lsusb` / `udevadm info /dev/ttyACM*` on your board first.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0d28", ATTRS{idProduct}=="0204", GROUP="uucp", MODE="0660", SYMLINK+="microbit-auth"
