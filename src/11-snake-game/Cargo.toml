@@ -26,5 +26,6 @@ rtt-target = "0.6.1"
 panic-rtt-target = "0.2.0"
 
 [features]
+default = ["v2"]
 v2 = ["microbit-v2"]
 v1 = ["microbit"]

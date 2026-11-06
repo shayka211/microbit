@@ -23,5 +23,6 @@ lsm303agr = "0.2.2"
 embedded-hal = "0.2.6"
 
 [features]
+default = ["v2"]
 v2 = ["microbit-v2"]
 v1 = ["microbit"]

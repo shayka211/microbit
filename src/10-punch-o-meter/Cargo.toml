@@ -21,5 +21,6 @@ lsm303agr = "0.2.2"
 nb = "1.0.0"
 
 [features]
+default = ["v2"]
 v2 = ["microbit-v2"]
 v1 = ["microbit"]

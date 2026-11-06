@@ -24,5 +24,6 @@ embedded-hal-nb = "1.0.0"
 embedded-io = "0.6.1"
 
 [features]
+default = ["v2"]
 v2 = ["microbit-v2"]
 v1 = ["microbit"]
