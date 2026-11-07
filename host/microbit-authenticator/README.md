@@ -15,23 +15,44 @@ frame codec and HMAC math are identical on both ends by construction.
 ## Build / run
 
 ```text
-cargo build -p microbit-authenticator --release
+cd host/microbit-authenticator
+cargo build --release
 target/release/microbit-authenticator --help
 ```
 
+## Code layout
+
+| File | What |
+|---|---|
+| `src/link.rs` | protocol client over any `Read + Write` (auth, ping, btn-test, provision, lock) |
+| `src/port.rs` | finding / opening the serial port |
+| `src/keyfile.rs` | loading / saving the host key |
+| `src/main.rs` | CLI + exit codes only |
+| `tests/fake_device.rs` | end-to-end tests against an in-memory board running the firmware's `authenticate::device` logic |
+| `tests/hardware.rs` | the same against the real board (`--ignored`) |
+
 ## Subcommands and exit codes
 
+| Command | |
+|---|---|
 | `auth` (default) | PAM entry point: send nonce, verify MAC → `0` success, `1` failure, `2` config error |
-| `test`           | interactive HITL check (same as `auth`, more chatter) |
-| `btn-test`       | `BTN_TEST` self-test: exits `0` only when the device writes after a real click |
+| `test`           | same as `auth`, with prompts for a human |
+| `btn-test`       | exits `0` only after a real press of button A |
 | `ping`           | reachability probe (`PING`/`PONG`) |
-| `keygen`         | print a fresh 64-hex 32-byte secret (`--out` writes it mode 0600) |
-| `provision`      | flash the secret into UICR + enable readback protection (`--key` or the host key file) |
+| `monitor`        | print everything the board sends (frames + firmware debug logs) |
+| `keygen`         | print a fresh 64-hex 32-byte secret (`--out` creates the file with mode 0600) |
+| `provision`      | write the secret into UICR, then lock readback (`--key`, or the host key file; `--no-lock` to stay re-provisionable) |
 
-Options: `--port` (or `MICROBIT_PORT`), `--timeout-ms`, `-v/--verbose`.
+Options: `--port` (or `MICROBIT_PORT`), `--timeout-ms`, `-v/--verbose` (show
+every line from the board).
 
-The device is auto-discovered via `/dev/serial/by-id/*CMSIS-DAP*if01*` (fallback:
-scan `/dev/ttyACM*`); `--port` overrides it.
+Default timeouts leave 2 s on top of the board's own window (auth 7 s,
+btn-test 32 s, others 3 s), so the board's verdict always arrives before the
+host gives up.
+
+Port: `--port`, else `/dev/microbit-auth` (udev rule), else the DAPLink
+`/dev/serial/by-id/*micro:bit*if01*`. There is no "any /dev/ttyACM*" fallback,
+so challenges never go to an unrelated serial device.
 
 ## Host key store
 
@@ -40,7 +61,8 @@ Default `/etc/microbit-auth/secret.key` (root:root, 0600) or `MICROBIT_KEY_FILE`
 ## Provisioning quick start
 
 1. Flash the firmware (see `src/12-authenticate`).
-2. `sudo install.sh` (see `deploy/`) → binary, key dir, udev rule, PAM drop-in.
+2. `cargo build --release`, then `sudo deploy/install.sh --no-pam` → binary, key dir, udev rule
+   (drop `--no-pam` to also add the PAM lines).
 3. `sudo microbit-authenticator keygen --out /etc/microbit-auth/secret.key`
    (already done by install.sh when the file was missing).
 4. `sudo microbit-authenticator provision` — key is written to the micro:bit UICR,
@@ -59,9 +81,9 @@ Default `/etc/microbit-auth/secret.key` (root:root, 0600) or `MICROBIT_KEY_FILE`
 
 ## Tests
 
+See `src/12-authenticate/VERIFY.md` (or just run `src/12-authenticate/verify.sh`).
+
 ```text
-cargo test -p microbit-authenticator      # host-side smoke tests
-cargo test -p authenticate --lib --no-default-features   # shared logic suite (11 tests)
-# on-device (board attached):
-cargo test --manifest-path src/12-authenticate/Cargo.toml --target thumbv7em-none-eabihf --test ondevice
+cargo test                                                  # fake-board end-to-end + shared protocol
+cargo test --test hardware -- --ignored --test-threads=1    # real board, no press needed
 ```

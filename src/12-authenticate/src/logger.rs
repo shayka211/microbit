@@ -1,14 +1,22 @@
 //! Global async logger — the **only** place that owns the UART TX.
 //!
 //! Any module calls `log_debug("tag", format_args!(...))` and the message
-//! is pushed into a global channel.  The `logger_task` drains the channel
-//! and writes to the wire (with `\r\n`).
+//! is pushed into a global channel.  The logger `task` drains it and writes
+//! to the wire (with `\r\n`).
 //!
-//! Protocol frame transmission also goes through the same channel
-//! (`send_frame`), so all UART output is serialised.
+//! Protocol frames (`send_frame`) use a **separate** queue so they can never
+//! be lost behind debug chatter:
+//! - frames: `send_frame().await` waits for space instead of dropping;
+//! - logs: dropped when their queue is full (debug only, never critical);
+//! - the task always writes pending frames before pending logs.
+//!
+//! Both share the one UART TX, so whole lines never interleave.
 
+#[cfg(debug_assertions)]
 use core::fmt::Write;
 
+#[cfg(debug_assertions)]
+use embassy_futures::select::{select, Either};
 use embassy_nrf::peripherals::UARTE0;
 use embassy_nrf::uarte::UarteTx;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -20,20 +28,25 @@ use authenticate::constants::MAX_FRAME_LEN;
 /// Channel message: up to `MAX_FRAME_LEN` bytes.
 type Msg = Vec<u8, MAX_FRAME_LEN>;
 
-/// Global queue — every `log_debug` / `send_frame` call pushes here.
-static QUEUE: Channel<CriticalSectionRawMutex, Msg, 16> = Channel::new();
+/// Protocol frames (never dropped).
+static FRAMES: Channel<CriticalSectionRawMutex, Msg, 4> = Channel::new();
+/// Debug-log lines (dropped when full).
+#[cfg(debug_assertions)]
+static LOGS: Channel<CriticalSectionRawMutex, Msg, 16> = Channel::new();
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Push raw bytes into the queue (non-blocking — drops if full).
-fn enqueue(data: &[u8]) {
+fn to_msg(data: &[u8]) -> Msg {
     let mut msg: Msg = Vec::new();
-    let _ = msg.extend_from_slice(data);
-    let _ = QUEUE.try_send(msg);
+    // Callers never exceed MAX_FRAME_LEN; truncate defensively if they do.
+    let n = data.len().min(MAX_FRAME_LEN);
+    let _ = msg.extend_from_slice(&data[..n]);
+    msg
 }
 
+#[cfg(debug_assertions)]
 fn fmt_buf<'a>(buf: &'a mut [u8], args: core::fmt::Arguments<'_>) -> &'a [u8] {
     let mut pos = 0;
     struct Sink<'a>(&'a mut [u8], &'a mut usize);
@@ -58,10 +71,10 @@ fn fmt_buf<'a>(buf: &'a mut [u8], args: core::fmt::Arguments<'_>) -> &'a [u8] {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Queue a protocol frame for transmission on the wire.
-/// The logger task will append `\r\n`.
-pub fn send_frame(data: &[u8]) {
-    enqueue(data);
+/// Queue a protocol frame for transmission (waits if the queue is full).
+/// The logger task appends `\r\n`.
+pub async fn send_frame(data: &[u8]) {
+    FRAMES.send(to_msg(data)).await;
 }
 
 /// Format and queue a debug-log line.  The logger task prepends the
@@ -88,7 +101,7 @@ pub fn log_debug(tag: &str, args: core::fmt::Arguments<'_>) {
             pos += 1;
         }
     }
-    enqueue(&line[..pos]);
+    let _ = LOGS.try_send(to_msg(&line[..pos]));
 }
 
 /// No-op in release builds — the compiler strips every call site.
@@ -100,12 +113,25 @@ pub fn log_debug(_tag: &str, _args: core::fmt::Arguments<'_>) {}
 // ---------------------------------------------------------------------------
 
 /// Dedicated task that owns the UART TX peripheral.
-/// Drains the global queue and writes every message to the wire.
+/// Writes every queued message to the wire, frames first.
 #[embassy_executor::task]
 pub async fn task(mut tx: UarteTx<'static, UARTE0>) {
     loop {
-        let msg = QUEUE.receive().await;
+        let msg = next_msg().await;
         let _ = tx.write(&msg).await;
         let _ = tx.write(b"\r\n").await;
     }
+}
+
+#[cfg(debug_assertions)]
+async fn next_msg() -> Msg {
+    // `select` polls its first future first, so a ready frame always wins.
+    match select(FRAMES.receive(), LOGS.receive()).await {
+        Either::First(m) | Either::Second(m) => m,
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn next_msg() -> Msg {
+    FRAMES.receive().await
 }

@@ -2,7 +2,9 @@
 # Host-side deployment for the micro:bit challenge-response login (CachyOS/Arch).
 #
 # Usage:
-#   sudo host/microbit-authenticator/deploy/install.sh            # install/enable
+#   cargo build --release            # first, as your user, in host/microbit-authenticator
+#   sudo host/microbit-authenticator/deploy/install.sh --no-pam   # binary + key + udev only
+#   sudo host/microbit-authenticator/deploy/install.sh            # ... and the PAM lines
 #   sudo host/microbit-authenticator/deploy/install.sh --uninstall
 #
 # What this does NOT do: flash the firmware or provision the secret into the
@@ -43,11 +45,20 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
-echo "== build (release) =="
-(cd "$REPO_ROOT" && cargo build -p microbit-authenticator --release)
+NO_PAM=0
+[[ "${1:-}" == "--no-pam" ]] && NO_PAM=1
+
+# Built beforehand as the normal user: root usually has no cargo, and building
+# as root would leave root-owned files in your target/ directory.
+BUILT="$HOST_DIR/target/release/microbit-authenticator"
+if [[ ! -x "$BUILT" ]]; then
+  echo "error: $BUILT not found — build it first (as your user):" >&2
+  echo "  (cd $HOST_DIR && cargo build --release)" >&2
+  exit 1
+fi
 
 echo "== install binary =="
-install -m 0755 -o root -g root "$REPO_ROOT/target/release/microbit-authenticator" "$BIN"
+install -m 0755 -o root -g root "$BUILT" "$BIN"
 
 echo "== key store =="
 mkdir -p "$KEY_DIR"
@@ -66,8 +77,13 @@ install -m 0644 "$SCRIPT_DIR/99-microbit-auth.rules" /etc/udev/rules.d/99-microb
 udevadm control --reload-rules 2>/dev/null || true
 udevadm trigger 2>/dev/null || true
 
-echo "== PAM =="
-for pam in "${PAM_FILES[@]}"; do
+if [[ $NO_PAM -eq 1 ]]; then
+  echo "== PAM: skipped (--no-pam) =="
+  PAM_FILES=()
+else
+  echo "== PAM =="
+fi
+for pam in "${PAM_FILES[@]+"${PAM_FILES[@]}"}"; do
   [[ -f "$pam" ]] || { echo "skip (not present): $pam"; continue; }
   cp -a "$pam" "${pam}${BACKUP_SUFFIX}"
   if grep -qF "$PAM_LINE" "$pam"; then
@@ -78,17 +94,23 @@ for pam in "${PAM_FILES[@]}"; do
   fi
 done
 
+if [[ $NO_PAM -eq 1 ]]; then
+  PAM_SUMMARY="not touched (--no-pam)"
+else
+  PAM_SUMMARY="sufficient pam_exec.so at top of /etc/pam.d/sddm [and kde]"
+fi
+
 cat <<EOF
 
 == deployed ==
   binary : $BIN
   key    : $KEY_FILE (root:root 0600)
   udev   : /etc/udev/rules.d/99-microbit-auth.rules -> /dev/microbit-auth
-  pam    : sufficient pam_exec.so at top of /etc/pam.d/sddm [and kde]
+  pam    : $PAM_SUMMARY
 
 == next steps (board side) ==
   1) flash firmware:  cd $REPO_ROOT/src/12-authenticate
-                      cargo embed --features v2 --target thumbv7em-none-eabihf
+                      cargo embed --release --target thumbv7em-none-eabihf
   2) provision key:   sudo $BIN provision          (uses $KEY_FILE)
   3) button check:    $BIN btn-test                (press Button A when LED waits)
   4) end-to-end:      loginctl lock-session        -> press A = instant unlock, ignore = password

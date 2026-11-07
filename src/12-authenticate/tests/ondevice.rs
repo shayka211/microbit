@@ -33,6 +33,8 @@ mod tests {
     use authenticate::constants::MAX_FRAME_LEN;
     use authenticate::crypto;
     use authenticate::protocol::Frame;
+    use authenticate::device::{self, Action, DeviceState};
+    use authenticate::pattern::{Pattern, Screen, View, BLANK};
     use authenticate::state::{ArmedEvent, ArmedKind, Debounce, Session};
 
     #[init]
@@ -84,6 +86,30 @@ mod tests {
             !crypto::verify(&bad, &k2, &n2),
             "constant-time verify rejects wrong MAC"
         );
+    }
+
+    #[test]
+    fn device_rules_on_device() {
+        let st = DeviceState {
+            provisioned: true,
+            locked: false,
+        };
+        defmt::assert!(device::on_line(b"PING", st) == Action::Reply(Frame::Pong));
+        let key = [0x42u8; 32];
+        let nonce = [0x24u8; 32];
+        let reply = device::armed_outcome(ArmedKind::Auth, ArmedEvent::Press(5), Some(&key), &nonce);
+        defmt::assert!(reply == Frame::AuthOk(crypto::sign(&key, &nonce)), "AUTH_OK carries the HMAC");
+    }
+
+    #[test]
+    fn display_timeline_on_device() {
+        let mut s = Screen::new(0);
+        s.apply(View::steady(Pattern::Waiting), 1_000);
+        defmt::assert!(s.bitmap(1_000) != BLANK, "blink starts on");
+        defmt::assert!(s.bitmap(1_500) == BLANK);
+        defmt::assert!(s.next_change(1_500) == Some(2_000));
+        s.apply(View::steady(Pattern::Idle), 3_000);
+        defmt::assert!(s.next_change(3_000).is_none(), "idle sleeps forever");
     }
 
     #[test]

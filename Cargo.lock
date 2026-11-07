@@ -27,8 +27,6 @@ dependencies = [
  "embassy-time",
  "heapless 0.8.0",
  "hmac",
- "microbit 0.12.0",
- "microbit-v2 0.12.0",
  "nrf52833-pac 0.12.2",
  "panic-halt",
  "panic-probe",

@@ -196,11 +196,13 @@ impl<'a> BufW<'a> {
 
 impl Frame {
     /// Encode into `out`, returns the number of bytes written (no terminator).
+    /// Fails if the frame does not fit in `out` (or exceeds `MAX_FRAME_LEN`).
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, ()> {
-        if out.len() > MAX_FRAME_LEN {
-            return Err(());
-        }
-        let mut w = BufW { buf: out, len: 0 };
+        let cap = out.len().min(MAX_FRAME_LEN);
+        let mut w = BufW {
+            buf: &mut out[..cap],
+            len: 0,
+        };
         match *self {
             Frame::Ping => w.str("PING")?,
             Frame::Lock => w.str("LOCK")?,
@@ -241,8 +243,30 @@ impl Frame {
                 w.str(kind.as_str())?;
             }
         }
-        let _ = out; // out already borrowed by w
         Ok(w.len)
+    }
+
+    /// The frame's keyword (`"AUTH_OK"`, `"PING"`, ...) — short, for logs.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Frame::Ping => "PING",
+            Frame::Auth(_) => "AUTH",
+            Frame::Prov(_) => "PROV",
+            Frame::Lock => "LOCK",
+            Frame::BtnTest => "BTN_TEST",
+            Frame::Hello { .. } => "HELLO",
+            Frame::Pong => "PONG",
+            Frame::Ready => "READY",
+            Frame::AuthOk(_) => "AUTH_OK",
+            Frame::AuthTimeout => "AUTH_TIMEOUT",
+            Frame::AuthErr(_) => "AUTH_ERR",
+            Frame::ProvOk => "PROV_OK",
+            Frame::ProvErr(_) => "PROV_ERR",
+            Frame::LockOk => "LOCK_OK",
+            Frame::BtnTestReady => "BTN_TEST_READY",
+            Frame::BtnPressed(_) => "BTN_PRESSED",
+            Frame::BtnTestTimeout => "BTN_TEST_TIMEOUT",
+        }
     }
 
     /// Parse one line (terminator already stripped by the caller).
@@ -377,5 +401,33 @@ mod tests {
         assert_eq!(Frame::parse(b"AUTH zz"), Err(ParseError::BadHex));
         assert_eq!(Frame::parse(b"BTN_PRESSED abc"), Err(ParseError::BadInt));
         assert_eq!(Frame::parse(b"HELLO AUTH/1.0"), Err(ParseError::BadLen));
+    }
+
+    #[test]
+    fn encode_accepts_any_big_enough_buffer() {
+        let mut big = [0u8; 256];
+        let n = Frame::AuthOk([0xab; 32]).encode(&mut big).expect("bigger buffer is fine");
+        assert_eq!(n, "AUTH_OK ".len() + 64);
+        let mut small = [0u8; 4];
+        assert!(Frame::Pong.encode(&mut small).is_ok());
+        assert!(Frame::Ready.encode(&mut small).is_err());
+    }
+
+    #[test]
+    fn name_is_the_wire_keyword() {
+        for f in [
+            Frame::Ping,
+            Frame::Auth([0; 32]),
+            Frame::Hello { magic: 1 },
+            Frame::AuthOk([0; 32]),
+            Frame::AuthErr(AuthErrKind::Busy),
+            Frame::BtnPressed(5),
+            Frame::BtnTestTimeout,
+        ] {
+            let mut buf = [0u8; MAX_FRAME_LEN];
+            let n = f.encode(&mut buf).unwrap();
+            let wire = core::str::from_utf8(&buf[..n]).unwrap();
+            assert_eq!(wire.split(' ').next(), Some(f.name()));
+        }
     }
 }

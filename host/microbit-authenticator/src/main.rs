@@ -5,19 +5,27 @@
 //! Exit codes (also the PAM contract):
 //!   0  authentication succeeded (allowed by `pam_exec` enough → password skipped)
 //!   1  authentication failed / timed out / wrong MAC
-//!   2  configuration or I/O problem
+//!   2  configuration or I/O problem (no board, no key file, ...)
+//!
+//! Everything goes to stderr; stdout is only used for `keygen` output.
 
-use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
-use authenticate::constants::MAX_FRAME_LEN;
-use authenticate::crypto::verify;
-use authenticate::protocol::Frame;
+use anyhow::{bail, Result};
+use authenticate::constants::{AUTH_WINDOW_MS, BTN_TEST_WINDOW_MS};
+use authenticate::protocol::{AuthErrKind, Key, ProvErrKind};
 use clap::{Parser, Subcommand};
+use microbit_authenticator::keyfile;
+use microbit_authenticator::link::{self, AuthOutcome, BtnOutcome, Link, ProvOutcome};
+use microbit_authenticator::port;
 use serialport::SerialPort;
+
+/// Extra time on top of the board's own window, so the board's verdict
+/// (press or AUTH_TIMEOUT) always arrives before we give up.
+const MARGIN_MS: u64 = 2_000;
+/// Default for quick request/reply commands.
+const QUICK_MS: u64 = 3_000;
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 
@@ -28,15 +36,15 @@ use serialport::SerialPort;
     about = "micro:bit challenge-response authenticator (PAM auth helper)"
 )]
 struct Cli {
-    /// Serial device (auto-detected via /dev/serial/by-id when omitted).
+    /// Serial device (default: /dev/microbit-auth, then /dev/serial/by-id).
     #[arg(long, env = "MICROBIT_PORT", global = true)]
     port: Option<String>,
 
-    /// Overall wait budget in milliseconds.
-    #[arg(long, default_value_t = 5_000, global = true)]
-    timeout_ms: u64,
+    /// How long to wait for the board, in ms (default depends on the command).
+    #[arg(long, global = true)]
+    timeout_ms: Option<u64>,
 
-    /// Verbose log lines on stderr.
+    /// Show every line from the board (incl. firmware debug logs) on stderr.
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
 
@@ -48,405 +56,207 @@ struct Cli {
 enum Cmd {
     /// Authenticate with the micro:bit — the PAM entry point (default).
     Auth,
-    /// Interactive hardware-in-the-loop check (same as auth, more output).
+    /// Same as `auth`, with human-friendly prompts.
     Test,
-    /// Button self-test: exits 0 only if the device writes after a real click.
+    /// Button self-test: exits 0 only after a real press of button A.
     BtnTest,
     /// PING/PONG reachability probe.
     Ping,
+    /// Print everything the board sends (frames + debug logs) until Ctrl-C.
+    ///
+    /// Don't run it next to another command: both would read the same port
+    /// and steal each other's lines. Use `-v` on that command instead.
+    Monitor,
     /// Generate a fresh 64-hex 32-byte secret.
     Keygen {
-        /// Also write it to this path (mode 0600).
+        /// Also write it to this path (created with mode 0600).
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Flash a secret into the micro:bit UICR, then enable readback lock.
+    /// Write a secret into the micro:bit UICR, then (by default) lock readback.
     Provision {
         /// 64-hex key; defaults to the host key file.
         #[arg(long)]
         key: Option<String>,
+        /// Skip the readback lock. The board can then be re-provisioned over
+        /// serial — use this while developing.
+        #[arg(long)]
+        no_lock: bool,
     },
 }
 
-// ── plumbing ───────────────────────────────────────────────────────────────
+impl Cmd {
+    fn default_timeout_ms(&self) -> u64 {
+        match self {
+            Cmd::Auth | Cmd::Test => AUTH_WINDOW_MS as u64 + MARGIN_MS,
+            Cmd::BtnTest => BTN_TEST_WINDOW_MS as u64 + MARGIN_MS,
+            _ => QUICK_MS,
+        }
+    }
+}
+
+struct Ctx {
+    port: Option<String>,
+    timeout: Duration,
+    verbose: bool,
+}
 
 fn main() {
     let cli = Cli::parse();
     let cmd = cli.cmd.clone().unwrap_or(Cmd::Auth);
-    info(&format!("start: {cmd:?} (verbose={})", cli.verbose));
+    let ctx = Ctx {
+        timeout: Duration::from_millis(cli.timeout_ms.unwrap_or_else(|| cmd.default_timeout_ms())),
+        port: cli.port,
+        verbose: cli.verbose,
+    };
+    info(&format!("start: {cmd:?}"));
     let code = match cmd {
-        Cmd::Auth => run_auth(&cli, false),
-        Cmd::Test => run_auth(&cli, true),
-        Cmd::BtnTest => run_btn_test(&cli),
-        Cmd::Ping => run_ping(&cli),
-        Cmd::Keygen { out } => run_keygen(out.as_deref()),
-        Cmd::Provision { key } => run_provision(&cli, key.as_deref()),
+        Cmd::Auth => run_auth(&ctx, false),
+        Cmd::Test => run_auth(&ctx, true),
+        Cmd::BtnTest => run_btn_test(&ctx),
+        Cmd::Ping => run_ping(&ctx),
+        Cmd::Monitor => run_monitor(&ctx),
+        Cmd::Keygen { out } => run_keygen(out),
+        Cmd::Provision { key, no_lock } => run_provision(&ctx, key.as_deref(), !no_lock),
     };
     std::process::exit(match code {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            info(&format!("error: {e:#}"));
             2
         }
     });
 }
 
-fn log(cli: &Cli, msg: &str) {
-    if cli.verbose {
-        eprintln!("{msg}");
-    }
-}
-
-/// Always-on lifecycle log line (stderr, so it never pollutes the PAM/exit contract).
+/// Timestamped lifecycle line on stderr (ends up in the pam_exec log).
 fn info(msg: &str) {
-    eprintln!("{msg}");
-}
-
-/// Verbose-only trace line, timestamped.
-fn trace(cli: &Cli, msg: &str) {
-    if cli.verbose {
-        eprintln!("[{}] {msg}", timestamp());
-    }
-}
-
-/// Monotonic-ish wall clock for trace lines.
-fn timestamp() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{}.{:03}", d.as_secs(), d.subsec_millis())
+    eprintln!("[{}.{:03}] {msg}", d.as_secs(), d.subsec_millis());
 }
 
-fn read_line_timeout_ms(cli: &Cli) -> u64 {
-    cli.timeout_ms.min(1_000).max(200)
+fn connect(ctx: &Ctx) -> Result<Link<Box<dyn SerialPort>>> {
+    let path = port::discover(ctx.port.as_deref())?;
+    info(&format!("serial: {path}"));
+    let mut link = Link::new(port::open(&path)?).with_echo(ctx.verbose);
+    link.drain()?;
+    Ok(link)
 }
 
-fn open_port(cli: &Cli) -> Result<Box<dyn SerialPort>> {
-    let path = discover_port(cli.port.as_deref())?;
-    info(&format!("opening {path} @ 115200 8N1"));
-    trace(cli, "serial: no flow control");
-    let port = serialport::new(&path, 115_200)
-        .timeout(Duration::from_millis(read_line_timeout_ms(cli)))
-        .open()
-        .with_context(|| format!("cannot open {path}"))?;
-    info("serial port open");
-    Ok(port)
-}
-
-fn discover_port(over: Option<&str>) -> Result<String> {
-    if let Some(p) = over {
-        return Ok(p.to_owned());
+fn load_host_key() -> Result<Key> {
+    let path = keyfile::path();
+    let (key, warning) = keyfile::load(&path)?;
+    if let Some(w) = warning {
+        info(&format!("warning: {w}"));
     }
-    if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
-        for e in entries.flatten() {
-            let path = e.path();
-            let name = path.to_string_lossy().to_string();
-            if (name.contains("CMSIS-DAP") || name.contains("MBED")) && name.contains("if01") {
-                return Ok(path.to_string_lossy().to_string());
-            }
-        }
-    }
-    for i in 0..8 {
-        let p = format!("/dev/ttyACM{i}");
-        if Path::new(&p).exists() {
-            return Ok(p);
-        }
-    }
-    bail!("no micro:bit serial device found (is it plugged in?)")
-}
-
-fn write_line(port: &mut dyn SerialPort, line: &[u8]) -> io::Result<()> {
-    port.write_all(line)?;
-    port.write_all(b"\r\n")?;
-    port.flush()
-}
-
-fn read_line(port: &mut dyn SerialPort) -> io::Result<Vec<u8>> {
-    let mut line = Vec::with_capacity(MAX_FRAME_LEN);
-    let mut b = [0u8; 1];
-    loop {
-        match port.read(&mut b) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::TimedOut, "no data")),
-            Ok(_) => {
-                if b[0] == b'\n' {
-                    break;
-                }
-                line.push(b[0]);
-                if line.len() > MAX_FRAME_LEN {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
-                }
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "no data"));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
-    Ok(line)
-}
-
-fn drain_input(port: &mut dyn SerialPort) {
-    std::thread::sleep(Duration::from_millis(200));
-    let mut d = [0u8; 128];
-    while let Ok(n) = port.read(&mut d) {
-        if n == 0 {
-            break;
-        }
-    }
-}
-
-fn send_frame(port: &mut dyn SerialPort, frame: &Frame) -> Result<()> {
-    let mut buf = [0u8; MAX_FRAME_LEN];
-    let n = frame.encode(&mut buf).map_err(|_| anyhow!("frame too long"))?;
-    write_line(port, &buf[..n])?;
-    Ok(())
-}
-
-fn host_key_path() -> PathBuf {
-    std::env::var_os("MICROBIT_KEY_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/etc/microbit-auth/secret.key"))
-}
-
-fn load_host_key() -> Result<[u8; 32]> {
-    let path = host_key_path();
-    info(&format!("key: reading {}", path.display()));
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("cannot read key file {}", path.display()))?;
-    let decoded = hex::decode(raw.trim()).with_context(|| "key file is not hex")?;
-    let key: [u8; 32] = decoded
-        .try_into()
-        .map_err(|_| anyhow!("key must be exactly 32 bytes (64 hex chars)"))?;
-    info("key: loaded 32-byte host secret");
     Ok(key)
 }
 
 // ── subcommands ────────────────────────────────────────────────────────────
 
-fn run_auth(cli: &Cli, interactive: bool) -> Result<i32> {
+fn run_auth(ctx: &Ctx, interactive: bool) -> Result<i32> {
     let key = load_host_key()?;
-    let mut port = open_port(cli)?;
-    drain_input(&mut *port);
-
+    let mut link = connect(ctx)?;
     let nonce: [u8; 32] = rand::random();
-    trace(cli, &format!("nonce: 32B {}", hex::encode(nonce)));
-    send_frame(&mut *port, &Frame::Auth(nonce))?;
-    trace(cli, &format!("tx: AUTH {}", hex::encode(nonce)));
-    info("tx: challenge AUTH sent");
-
-    let deadline = Instant::now() + Duration::from_millis(cli.timeout_ms);
-    loop {
-        if Instant::now() >= deadline {
-            info("result: FAILURE (timeout)");
-            return Ok(1);
+    if interactive {
+        eprintln!("→ press button A on the micro:bit (middle row blinks)…");
+    }
+    let outcome = link::authenticate(&mut link, &key, &nonce, ctx.timeout)?;
+    let (code, msg) = match outcome {
+        AuthOutcome::Ok => (0, "OK (button pressed, MAC verified)"),
+        AuthOutcome::BadMac => (1, "FAILURE (MAC mismatch: board and host keys differ)"),
+        AuthOutcome::ButtonTimeout => (1, "FAILURE (button not pressed in time)"),
+        AuthOutcome::Refused(AuthErrKind::Unprovisioned) => {
+            (1, "FAILURE (board has no key: run `provision`)")
         }
-        let line = match read_line(&mut *port) {
-            Ok(l) => l,
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
-            Err(e) => return Err(e.into()),
-        };
-        match Frame::parse(&line) {
-            Ok(Frame::Ready) => {
-                trace(cli, "rx: READY (challenge accepted, awaiting button A)");
+        AuthOutcome::Refused(AuthErrKind::Busy) => (1, "FAILURE (board busy)"),
+        AuthOutcome::NoAnswer => (1, "FAILURE (no answer from board)"),
+    };
+    info(&format!("result: {msg}"));
+    if interactive {
+        eprintln!(
+            "{}",
+            if code == 0 {
+                "authenticated via micro:bit ✓"
+            } else {
+                "not authenticated ✗"
             }
-            Ok(Frame::AuthOk(mac)) => {
-                let ok = verify(&mac, &key, &nonce);
-                log(
-                    cli,
-                    &format!(
-                        "verify: expected={} received={} match={}",
-                        hex::encode(verify_expected(&key, &nonce)),
-                        hex::encode(mac),
-                        if ok { "TRUE (constant-time)" } else { "FALSE" }
-                    ),
-                );
-                if ok {
-                    info("result: OK (MAC verified)");
-                } else {
-                    info("result: FAILURE (MAC mismatch)");
-                }
-                if interactive {
-                    eprintln!("authenticated via micro:bit ✓");
-                }
-                return Ok(if ok { 0 } else { 1 });
-            }
-            Ok(Frame::AuthTimeout) => {
-                trace(cli, "rx: AUTH_TIMEOUT (button not pressed in time)");
-                info("result: FAILURE (button timeout)");
-                return Ok(1);
-            }
-            Ok(Frame::AuthErr(kind)) => {
-                trace(cli, &format!("rx: AUTH_ERR {}", kind.as_str()));
-                info(&format!("result: FAILURE (device: {})", kind.as_str()));
-                return Ok(1);
-            }
-            Ok(_) => trace(cli, "rx: unrelated frame ignored"),
-            Err(e) => trace(cli, &format!("rx: parse error {e:?} (ignored)")),
+        );
+    }
+    Ok(code)
+}
+
+fn run_btn_test(ctx: &Ctx) -> Result<i32> {
+    let mut link = connect(ctx)?;
+    eprintln!("→ press button A on the micro:bit (middle row blinks)…");
+    let (code, msg) = match link::btn_test(&mut link, ctx.timeout)? {
+        BtnOutcome::Pressed(ms) => (0, format!("OK (press after {ms} ms)")),
+        BtnOutcome::DeviceTimeout => (1, "FAILURE (board timed out waiting for a press)".into()),
+        BtnOutcome::NoAnswer => (1, "FAILURE (no answer from board)".into()),
+    };
+    info(&format!("result: {msg}"));
+    Ok(code)
+}
+
+fn run_ping(ctx: &Ctx) -> Result<i32> {
+    let mut link = connect(ctx)?;
+    let ok = link::ping(&mut link, ctx.timeout)?;
+    info(if ok {
+        "result: OK (PONG)"
+    } else {
+        "result: FAILURE (no PONG)"
+    });
+    Ok(if ok { 0 } else { 1 })
+}
+
+fn run_monitor(ctx: &Ctx) -> Result<i32> {
+    let path = port::discover(ctx.port.as_deref())?;
+    info(&format!(
+        "monitor: {path} (Ctrl-C to quit; replug/reset the board to see HELLO)"
+    ));
+    let mut link = Link::new(port::open(&path)?);
+    loop {
+        if let Some(line) = link.poll_line()? {
+            info(&String::from_utf8_lossy(&line));
         }
     }
 }
 
-fn verify_expected(key: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
-    authenticate::crypto::sign(key, nonce)
-}
-
-fn run_btn_test(cli: &Cli) -> Result<i32> {
-    let mut port = open_port(cli)?;
-    drain_input(&mut *port);
-    send_frame(&mut *port, &Frame::BtnTest)?;
-    trace(cli, "tx: BTN_TEST");
-    info("tx: BTN_TEST (press Button A when the display blinks)");
-
-    let deadline = Instant::now() + Duration::from_millis(cli.timeout_ms);
-    loop {
-        if Instant::now() >= deadline {
-            trace(cli, "result: FAILURE (no BTN_PRESSED within timeout)");
-            return Ok(1);
-        }
-        let line = match read_line(&mut *port) {
-            Ok(l) => l,
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
-            Err(e) => return Err(e.into()),
-        };
-        match Frame::parse(&line) {
-            Ok(Frame::BtnTestReady) => trace(cli, "rx: BTN_TEST_READY (device silent until a real click)"),
-            Ok(Frame::BtnPressed(ms)) => {
-                trace(cli, &format!("rx: BTN_PRESSED {ms}ms (elapsed since arming)"));
-                info("result: OK (real button press observed)");
-                return Ok(0);
-            }
-            Ok(Frame::BtnTestTimeout) => {
-                trace(cli, "rx: BTN_TEST_TIMEOUT (no press in window)");
-                info("result: FAILURE (device timed out waiting for press)");
-                return Ok(1);
-            }
-            Ok(_) => trace(cli, "rx: unrelated frame ignored"),
-            Err(e) => trace(cli, &format!("rx: parse error {e:?} (ignored)")),
-        }
-    }
-}
-
-fn run_ping(cli: &Cli) -> Result<i32> {
-    let mut port = open_port(cli)?;
-    drain_input(&mut *port);
-    send_frame(&mut *port, &Frame::Ping)?;
-    trace(cli, "tx: PING");
-    info("tx: PING");
-
-    let deadline = Instant::now() + Duration::from_millis(cli.timeout_ms);
-    loop {
-        if Instant::now() >= deadline {
-            trace(cli, "result: FAILURE (no PONG)");
-            return Ok(1);
-        }
-        let line = match read_line(&mut *port) {
-            Ok(l) => l,
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
-            Err(e) => return Err(e.into()),
-        };
-        match Frame::parse(&line) {
-            Ok(Frame::Pong) => {
-                trace(cli, "rx: PONG");
-                info("result: OK (device answered PONG)");
-                return Ok(0);
-            }
-            Ok(_) => trace(cli, "rx: unrelated frame ignored"),
-            Err(e) => trace(cli, &format!("rx: parse error {e:?} (ignored)")),
-        }
-    }
-}
-
-fn run_keygen(out: Option<&Path>) -> Result<i32> {
-    let key: [u8; 32] = rand::random();
-    let hexs = hex::encode(key);
-    println!("{hexs}");
+fn run_keygen(out: Option<PathBuf>) -> Result<i32> {
+    let key: Key = rand::random();
+    println!("{}", hex::encode(key));
     if let Some(p) = out {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(p)
-            .with_context(|| format!("cannot write {}", p.display()))?;
-        f.write_all(format!("{hexs}\n").as_bytes())?;
-        f.sync_all()?;
-        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
-        info(&format!("keygen: wrote 32-byte key to {} (mode 0600)", p.display()));
+        keyfile::save(&p, &key)?;
+        info(&format!("keygen: wrote key to {} (mode 600)", p.display()));
     }
     Ok(0)
 }
 
-fn run_provision(cli: &Cli, key_arg: Option<&str>) -> Result<i32> {
-    let key: [u8; 32] = match key_arg {
-        Some(h) => {
-            let d = hex::decode(h).map_err(|_| anyhow!("--key is not valid hex"))?;
-            d.try_into().map_err(|_| anyhow!("--key must be 32 bytes (64 hex chars)"))?
-        }
+fn run_provision(ctx: &Ctx, key_arg: Option<&str>, lock: bool) -> Result<i32> {
+    let key = match key_arg {
+        Some(h) => keyfile::parse_hex(h)?,
         None => load_host_key()?,
     };
-    info("provision: using 32-byte key");
+    let mut link = connect(ctx)?;
 
-    let mut port = open_port(cli)?;
-    drain_input(&mut *port);
-
-    // 1) PROV → expect PROV_OK
-    send_frame(&mut *port, &Frame::Prov(key))?;
-    trace(cli, &format!("tx: PROV {}", hex::encode(key)));
-    info("provision: tx PROV (flash key + magic)");
-    let deadline = Instant::now() + Duration::from_millis(cli.timeout_ms);
-    let mut provisioned = false;
-    while !provisioned {
-        if Instant::now() >= deadline {
-            bail!("timeout waiting for PROV_OK");
-        }
-        let line = match read_line(&mut *port) {
-            Ok(l) => l,
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
-            Err(e) => return Err(e.into()),
-        };
-        match Frame::parse(&line) {
-            Ok(Frame::ProvOk) => {
-                trace(cli, "rx: PROV_OK (key written, readback verified)");
-                info("provision: PROV_OK (key flashed + verified)");
-                provisioned = true;
-            }
-            Ok(Frame::ProvErr(kind)) => {
-                trace(cli, &format!("rx: PROV_ERR {}", kind.as_str()));
-                info(&format!("provision: FAILURE (device: {})", kind.as_str()));
-                return Ok(1);
-            }
-            Ok(_) => {}
-            Err(e) => trace(cli, &format!("rx: parse error {e:?} (ignored)")),
-        }
+    match link::provision(&mut link, &key, ctx.timeout)? {
+        ProvOutcome::Ok => info("provision: PROV_OK (key written and read back)"),
+        ProvOutcome::Refused(ProvErrKind::Already) => bail!(
+            "board is readback-locked and refuses a new key; \
+             full chip erase + reflash needed (probe-rs erase --chip nRF52833_xxAA --allow-erase-all)"
+        ),
+        ProvOutcome::Refused(kind) => bail!("board refused the key: {}", kind.as_str()),
+        ProvOutcome::NoAnswer => bail!("no answer to PROV"),
     }
 
-    // 2) LOCK → expect LOCK_OK (device then resets with HELLO)
-    send_frame(&mut *port, &Frame::Lock)?;
-    trace(cli, "tx: LOCK");
-    info("provision: tx LOCK (enable APPROTECT readback protection)");
-    let deadline = Instant::now() + Duration::from_millis(cli.timeout_ms);
-    loop {
-        let line = match read_line(&mut *port) {
-            Ok(l) => l,
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                if Instant::now() >= deadline {
-                    bail!("timeout waiting for LOCK_OK");
-                }
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        match Frame::parse(&line) {
-            Ok(Frame::LockOk) => {
-                trace(cli, "rx: LOCK_OK → readback protection enabled (reset after)");
-                info("provision: LOCK_OK (readback protection enabled)");
-                return Ok(0);
-            }
-            Ok(_) => {}
-            Err(e) => trace(cli, &format!("rx: parse error {e:?} (ignored)")),
-        }
+    if !lock {
+        info("provision: done (not locked — re-provisioning stays possible)");
+        return Ok(0);
     }
+    if !link::lock(&mut link, ctx.timeout)? {
+        bail!("no answer to LOCK");
+    }
+    info("provision: LOCK_OK (readback protection on; board resets)");
+    Ok(0)
 }

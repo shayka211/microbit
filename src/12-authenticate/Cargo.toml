@@ -14,14 +14,6 @@ name = "authenticate"
 path = "src/main.rs"
 required-features = ["v2"]
 
-[dependencies.microbit-v2]
-version = "0.12.0"
-optional = true
-
-[dependencies.microbit]
-version = "0.12.0"
-optional = true
-
 # Library-only dependencies: anything here is host-compilable and is what the
 # reusable protocol/crypto code (and the host tool) depends on.
 [dependencies]
@@ -58,6 +50,8 @@ path = "tests/ondevice.rs"
 harness = false
 
 [features]
+# The firmware talks to the nRF52833 directly through embassy-nrf, so it only
+# supports the micro:bit v2. `v2` is kept (and on by default) so the usual
+# `cargo embed --features v2 ...` command keeps working.
 default = ["v2"]
-v2 = ["microbit-v2"]
-v1 = ["microbit"]
+v2 = []

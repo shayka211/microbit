@@ -75,6 +75,7 @@ mod tests {
     #[test]
     fn vector_2_constant_time_verify() {
         let mac = sign(&K2, &N2);
+        assert_eq!(mac, M2);
         assert!(verify(&mac, &K2, &N2));
         assert!(!verify(&M1, &K2, &N2));
         // mutated ciphertext must fail

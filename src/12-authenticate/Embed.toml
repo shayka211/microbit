@@ -6,9 +6,9 @@ chip = "nrf52833_xxAA" # uncomment this line for micro:bit V2
 halt_afterwards = false
 
 [default.rtt]
-# RTT is enabled so `cargo embed` decodes and prints defmt logs live
-# (requires -Tdefmt.x in .cargo/config.toml so the binary carries the
-# .defmt section). This is how you SEE the firmware working.
+# Off on purpose: the firmware logs over the UART (debug builds only), next to
+# the protocol frames. Watch them with `microbit-authenticator monitor` or
+# `microbit-authenticator -v <command>` from host/microbit-authenticator.
 enabled = false
 
 [default.gdb]

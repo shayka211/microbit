@@ -22,12 +22,13 @@ fn main() {
         .unwrap();
     println!("cargo:rustc-link-search={}", out.display());
 
-    // defmt linker script — only needed when defmt is in the dependency
-    // graph (i.e. when building the on‑device test binary).  The defmt
-    // crate sets `DEP_DEFMT_*` env vars via its build script; we only
-    // emit `-Tdefmt.x` when those vars exist.
-    if std::env::var("DEP_DEFMT_OUT_DIR").is_ok() {
-        println!("cargo:rustc-link-arg=-Tdefmt.x");
+    // defmt linker script for the on-device test binary (`tests/ondevice.rs`)
+    // only. defmt is a dev-dependency there, and Cargo does not expose
+    // dev-dependency metadata to build scripts, so decide by target instead.
+    // `-tests` scopes the flag to test binaries: the firmware stays defmt-free
+    // and host `cargo test --lib` is unaffected.
+    if env::var("TARGET").is_ok_and(|t| t.starts_with("thumbv")) {
+        println!("cargo:rustc-link-arg-tests=-Tdefmt.x");
     }
 
     // By default, Cargo will re-run a build script whenever

@@ -89,6 +89,12 @@ pub fn enable_readback_protection() {
     wait_ready();
 }
 
+/// `true` once `enable_readback_protection` has been written (UICR value 0).
+/// An erased UICR reads `0xFFFF_FFFF`.
+pub fn is_locked() -> bool {
+    unsafe { ptr::read_volatile(UICR_APPROTECT_ADDR as *const u32) == 0 }
+}
+
 /// Hard system reset (required for APPROTECT to become active).
 pub fn reset_chip() -> ! {
     SCB::sys_reset()

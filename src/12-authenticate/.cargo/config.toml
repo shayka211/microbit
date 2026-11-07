@@ -7,3 +7,10 @@ rustflags = [
 # flashes the test binary with probe-rs and runs it on the real M4.
 [target.thumbv7em-none-eabihf]
 runner = "probe-rs run --chip nRF52833_xxAA"
+# Shortcuts (run from this folder):
+#   cargo embed-dev   debug build: firmware debug logs (#INF/#WRN lines) on the UART
+#   cargo embed-rel   release build: protocol frames only — use this for daily login
+# Watch the UART with: microbit-authenticator monitor
+[alias]
+embed-dev = "embed --target thumbv7em-none-eabihf"
+embed-rel = "embed --release --target thumbv7em-none-eabihf"
