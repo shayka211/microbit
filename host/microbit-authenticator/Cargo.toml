@@ -10,8 +10,13 @@ name = "microbit-authenticator"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
 authenticate = { path = "../../src/12-authenticate", default-features = false }
+
+# PC-only dependencies. Scoped so that building this crate for the micro:bit
+# (e.g. `cargo embed` in this folder by mistake) stops at the clear message in
+# src/lib.rs instead of a confusing error deep inside `getrandom`.
+[target.'cfg(not(target_os = "none"))'.dependencies]
+anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
 rand = "0.8"

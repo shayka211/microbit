@@ -36,23 +36,43 @@ pub fn load_key() -> Option<[u8; 32]> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyError {
+    /// UICR did not read back as all-ones after the erase.
+    EraseFail,
+    /// The written key / magic did not read back correctly.
     ReadbackFail,
 }
 
-/// Erase the whole UICR page (needed before writing new bits).
+/// Erase the whole UICR page back to all-ones (needed before writing new
+/// bits: flash writes can only turn 1s into 0s).
+///
+/// Note: this also clears the other UICR settings (APPROTECT, NFCPINS, ...);
+/// they are all at their erased defaults on this board anyway.
 fn erase_uicr() {
     let r = regs();
-    r.config.write(|w| w.wen().een()); // erase-page mode
+    r.config.write(|w| w.wen().een()); // erase mode
     wait_ready();
-    r.eraseuicr.write(|w| unsafe { w.bits(UICR_KEY_BASE) });
+    // ERASEUICR is a trigger register: writing 1 starts the erase.
+    r.eraseuicr.write(|w| w.eraseuicr().erase());
     wait_ready();
     r.config.write(|w| w.wen().ren());
     wait_ready();
 }
 
+fn uicr_word(addr: u32) -> u32 {
+    unsafe { ptr::read_volatile(addr as *const u32) }
+}
+
 /// Flash a new key (plus magic word) into UICR and verify by read-back.
 pub fn provision(key: &[u8; 32]) -> Result<(), KeyError> {
+    if load_key().as_ref() == Some(key) {
+        return Ok(()); // already there — don't wear the flash
+    }
     erase_uicr();
+    let erased = (0..8).all(|i| uicr_word(UICR_KEY_BASE + i * 4) == 0xFFFF_FFFF)
+        && uicr_word(UICR_MAGIC_ADDR) == 0xFFFF_FFFF;
+    if !erased {
+        return Err(KeyError::EraseFail);
+    }
 
     let r = regs();
     r.config.write(|w| w.wen().wen()); // write mode

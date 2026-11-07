@@ -135,11 +135,24 @@ pub fn authenticate<T: Read + Write>(
     nonce: &Nonce,
     timeout: Duration,
 ) -> io::Result<AuthOutcome> {
+    authenticate_with(link, key, nonce, timeout, || {})
+}
+
+/// [`authenticate`], calling `on_ready` once the board has armed (i.e. the
+/// moment the user should press the button).
+pub fn authenticate_with<T: Read + Write>(
+    link: &mut Link<T>,
+    key: &Key,
+    nonce: &Nonce,
+    timeout: Duration,
+    mut on_ready: impl FnMut(),
+) -> io::Result<AuthOutcome> {
     link.send(&Frame::Auth(*nonce))?;
     let mut armed = false;
     let outcome = link.wait_for(timeout, |f| match f {
-        Frame::Ready => {
+        Frame::Ready if !armed => {
             armed = true;
+            on_ready();
             None
         }
         Frame::AuthErr(kind) => Some(AuthOutcome::Refused(kind)),

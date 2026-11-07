@@ -7,7 +7,8 @@
 //!   1  authentication failed / timed out / wrong MAC
 //!   2  configuration or I/O problem (no board, no key file, ...)
 //!
-//! Everything goes to stderr; stdout is only used for `keygen` output.
+//! stdout: only short messages for the user ("press button A", `keygen`'s key).
+//! stderr: timestamped diagnostics (pam_exec's `log=` file under PAM).
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -128,6 +129,15 @@ fn main() {
     });
 }
 
+/// A message for the person at the keyboard, on stdout. Under PAM, the
+/// `stdout` option of pam_exec forwards it to the terminal (e.g. sudo's).
+fn say(msg: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{msg}");
+    let _ = out.flush();
+}
+
 /// Timestamped lifecycle line on stderr (ends up in the pam_exec log).
 fn info(msg: &str) {
     let d = SystemTime::now()
@@ -159,10 +169,14 @@ fn run_auth(ctx: &Ctx, interactive: bool) -> Result<i32> {
     let key = load_host_key()?;
     let mut link = connect(ctx)?;
     let nonce: [u8; 32] = rand::random();
-    if interactive {
-        eprintln!("→ press button A on the micro:bit (middle row blinks)…");
-    }
-    let outcome = link::authenticate(&mut link, &key, &nonce, ctx.timeout)?;
+    let secs = ctx.timeout.as_secs().min(AUTH_WINDOW_MS as u64 / 1000);
+    let outcome = link::authenticate_with(&mut link, &key, &nonce, ctx.timeout, || {
+        // Only once the board is armed: with no board there is no prompt and
+        // PAM moves straight on to the password.
+        say(&format!(
+            "micro:bit: press button A within {secs} s (or wait for the password prompt)"
+        ));
+    })?;
     let (code, msg) = match outcome {
         AuthOutcome::Ok => (0, "OK (button pressed, MAC verified)"),
         AuthOutcome::BadMac => (1, "FAILURE (MAC mismatch: board and host keys differ)"),
@@ -174,15 +188,17 @@ fn run_auth(ctx: &Ctx, interactive: bool) -> Result<i32> {
         AuthOutcome::NoAnswer => (1, "FAILURE (no answer from board)"),
     };
     info(&format!("result: {msg}"));
+    match outcome {
+        AuthOutcome::Ok => say("micro:bit: OK"),
+        AuthOutcome::BadMac => say("micro:bit: key mismatch (re-provision the board)"),
+        _ => {}
+    }
     if interactive {
-        eprintln!(
-            "{}",
-            if code == 0 {
-                "authenticated via micro:bit ✓"
-            } else {
-                "not authenticated ✗"
-            }
-        );
+        say(if code == 0 {
+            "authenticated via micro:bit ✓"
+        } else {
+            "not authenticated ✗"
+        });
     }
     Ok(code)
 }

@@ -272,3 +272,17 @@ fn unlocked_board_can_be_reprovisioned_locked_one_cannot() {
     );
     assert_eq!(b.key, Some(KEY), "locked key unchanged");
 }
+
+#[test]
+fn ready_callback_fires_once_and_only_when_armed() {
+    let mut calls = 0;
+    let mut b = FakeBoard::new(Some(KEY));
+    let out = link::authenticate_with(&mut Link::new(&mut b), &KEY, &[1; 32], T, || calls += 1);
+    assert_eq!((out.unwrap(), calls), (AuthOutcome::Ok, 1));
+
+    let mut calls = 0;
+    let mut b = FakeBoard::new(None);
+    let out = link::authenticate_with(&mut Link::new(&mut b), &KEY, &[1; 32], T, || calls += 1);
+    assert_eq!(calls, 0, "no 'press A' prompt when the board refuses");
+    assert_eq!(out.unwrap(), AuthOutcome::Refused(AuthErrKind::Unprovisioned));
+}

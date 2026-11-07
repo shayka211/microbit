@@ -1,9 +1,10 @@
 # microbit-authenticator (host)
 
-Host side of the micro:bit challenge–response login (PAM helper on CachyOS/Arch).
+Host side of the micro:bit challenge–response check: `sudo` accepts button A
+on the micro:bit **or** your password (PAM helper on CachyOS/Arch).
 
 ```
- ┌ SDDM greeter / KDE lock screen ─► pam_exec.so ─► microbit-authenticator ─► /dev/ttyACM0 ─► micro:bit
+ ┌ sudo ─────────────────────────► pam_exec.so ─► microbit-authenticator ─► /dev/ttyACM0 ─► micro:bit
  │                                                                                              │
  │  exit 0 (sufficient)  login     nonce ──► HMAC-SHA256(key, nonce) ◄── button A press          │
  └───────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -58,17 +59,28 @@ so challenges never go to an unrelated serial device.
 
 Default `/etc/microbit-auth/secret.key` (root:root, 0600) or `MICROBIT_KEY_FILE`.
 
-## Provisioning quick start
+## Setting up sudo (button A *or* password)
 
-1. Flash the firmware (see `src/12-authenticate`).
-2. `cargo build --release`, then `sudo deploy/install.sh --no-pam` → binary, key dir, udev rule
-   (drop `--no-pam` to also add the PAM lines).
-3. `sudo microbit-authenticator keygen --out /etc/microbit-auth/secret.key`
-   (already done by install.sh when the file was missing).
-4. `sudo microbit-authenticator provision` — key is written to the micro:bit UICR,
-   read back and verified, then `APPROTECT` enables readback lock and the board resets.
-5. `microbit-authenticator btn-test` — press Button A when the LED blinks.
-6. `loginctl lock-session` — press A = instant unlock; ignore = password prompt.
+Everything goes through `deploy/install.sh`; each step is its own command and
+only `enable-sudo` touches `/etc/pam.d/sudo`.
+
+1. Flash the release firmware: `cd src/12-authenticate && cargo embed-rel`.
+2. `cargo build --release` (as your user), then `sudo deploy/install.sh install`
+   → binary in `/usr/local/bin`, root-only key in `/etc/microbit-auth`, udev
+   rule, and a button-only **test** PAM service `/etc/pam.d/microbit-test`.
+3. `sudo microbit-authenticator provision --no-lock` — the board stores the
+   system key (stays re-provisionable; lock later with plain `provision`).
+4. Try the test service: `sudo pamtester microbit-test $USER authenticate`
+   (AUR `pamtester`). Press A → success; wait → failure.
+5. Open a second terminal with `sudo -i` as a safety net, then
+   `sudo deploy/install.sh enable-sudo`, and check with `sudo -k; sudo true`.
+6. Undo any time: `sudo deploy/install.sh disable-sudo` (removes exactly the
+   two added lines). `status` shows what's installed; `uninstall` removes all
+   but the key.
+
+What it feels like: `sudo …` → "micro:bit: press button A within 5 s" and the
+middle row blinks → press = root. No press, board unplugged or wrong key → the
+normal password prompt. Diagnostics: `/var/log/microbit-auth.log`.
 
 ### Security notes
 
@@ -78,6 +90,9 @@ Default `/etc/microbit-auth/secret.key` (root:root, 0600) or `MICROBIT_KEY_FILE`
   re-provisioning requires the full-chip erase described in the module README.
 - Nonces are fresh per attempt, so replays fail; MAC comparison is constant-time.
 - Physical possession of the micro:bit is possession of the key (that's the point).
+- The board can't show *which* command asks. Any program running as you could
+  start `sudo` and wait for a press — only press A right after you typed sudo
+  yourself (same rule as a USB security key).
 
 ## Tests
 

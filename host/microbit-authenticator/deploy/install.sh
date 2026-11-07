@@ -1,120 +1,231 @@
 #!/usr/bin/env bash
-# Host-side deployment for the micro:bit challenge-response login (CachyOS/Arch).
+# Install the micro:bit authenticator so `sudo` accepts EITHER button A on the
+# micro:bit OR your password.
 #
-# Usage:
-#   cargo build --release            # first, as your user, in host/microbit-authenticator
-#   sudo host/microbit-authenticator/deploy/install.sh --no-pam   # binary + key + udev only
-#   sudo host/microbit-authenticator/deploy/install.sh            # ... and the PAM lines
-#   sudo host/microbit-authenticator/deploy/install.sh --uninstall
+# Each step is a separate command, so nothing touches sudo until you ask:
 #
-# What this does NOT do: flash the firmware or provision the secret into the
-# micro:bit. Those steps are printed at the end and live in the module README.
+#   (cd host/microbit-authenticator && cargo build --release)   # as your user
+#   sudo deploy/install.sh install        # binary + key + udev + button-only TEST service
+#   sudo deploy/install.sh status         # what is installed right now
+#   sudo deploy/install.sh enable-sudo    # add the button line to /etc/pam.d/sudo
+#   sudo deploy/install.sh disable-sudo   # remove it again (exactly our 2 lines)
+#   sudo deploy/install.sh uninstall      # remove everything except the key
+#
+# Safety:
+# - The sudo line is `sufficient`: if the button check fails for ANY reason
+#   (no press, board unplugged, wrong key, crash) sudo asks for the password
+#   as before. Only our two lines are ever added/removed; the file is
+#   rewritten atomically and checked to be otherwise unchanged.
+# - `install` never touches /etc/pam.d/sudo. It adds a separate
+#   /etc/pam.d/microbit-test service (button only, no password) to try first.
+#
+# Testing this script itself: MICROBIT_INSTALL_ROOT=/some/dir runs everything
+# against <dir>/etc, <dir>/usr/... instead of the real system (no root needed).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST_DIR="$(dirname "$SCRIPT_DIR")"
-REPO_ROOT="$(cd "$HOST_DIR/../.." && pwd)"
+R="${MICROBIT_INSTALL_ROOT:-}" # empty = the real system
 
-BIN="/usr/local/bin/microbit-authenticator"
-KEY_DIR="/etc/microbit-auth"
+BIN_PATH="/usr/local/bin/microbit-authenticator" # path as seen by PAM
+BIN="$R$BIN_PATH"
+KEY_DIR="$R/etc/microbit-auth"
 KEY_FILE="$KEY_DIR/secret.key"
-PAM_LINE='auth sufficient pam_exec.so quiet log=/var/log/microbit-auth.log /usr/local/bin/microbit-authenticator auth'
-PAM_FILES=(/etc/pam.d/sddm /etc/pam.d/kde)
-BACKUP_SUFFIX=".bak-microbit-auth"
+UDEV_RULE="$R/etc/udev/rules.d/99-microbit-auth.rules"
+SUDO_PAM="$R/etc/pam.d/sudo"
+TEST_PAM="$R/etc/pam.d/microbit-test"
+LOG_PATH="/var/log/microbit-auth.log"
+BACKUP="$SUDO_PAM.bak-microbit-auth"
 
-if [[ $EUID -ne 0 ]]; then
-  echo "error: run as root (sudo $0)" >&2
-  exit 1
+# pam_exec options:
+#   quiet    no "pam_exec failed" noise when the button is not pressed
+#   stdout   show the helper's "press button A" line in your terminal
+#   seteuid  run the helper as root (sudo's effective user), so it can read
+#            the root-only key file — without this it runs as you and fails
+#   log=     the helper's diagnostics (stderr) go here
+PAM_LINE="auth       sufficient   pam_exec.so quiet stdout seteuid log=$LOG_PATH $BIN_PATH auth"
+MARK="# microbit-authenticator: button A or password (managed by install.sh)"
+
+die() { echo "error: $*" >&2; exit 1; }
+real_system() { [[ -z "$R" ]]; }
+
+if real_system && [[ $EUID -ne 0 ]]; then
+  die "run as root: sudo $0 ${1:-install}"
 fi
 
-if [[ "${1:-}" == "--uninstall" ]]; then
-  echo "== removing PAM line + restoring backups =="
-  for pam in "${PAM_FILES[@]}"; do
-    [[ -f "$pam" ]] || continue
-    grep -qvF "$PAM_LINE" "$pam" || sed -i "/${PAM_LINE}/d" "$pam"
-    if [[ -f "${pam}${BACKUP_SUFFIX}" ]]; then
-      cp -a "${pam}${BACKUP_SUFFIX}" "$pam"
-      rm -f "${pam}${BACKUP_SUFFIX}"
-    fi
-    echo "restored $pam"
-  done
-  rm -f /etc/udev/rules.d/99-microbit-auth.rules /var/log/microbit-auth.log
-  echo "udev rule removed (reload with: sudo udevadm control --reload-rules)"
-  echo "binary + key dir left in place; remove manually if desired:"
-  echo "  rm -f $BIN && rm -rf $KEY_DIR"
-  exit 0
-fi
+# ── /etc/pam.d/sudo editing ───────────────────────────────────────────────
 
-NO_PAM=0
-[[ "${1:-}" == "--no-pam" ]] && NO_PAM=1
+# Write $2 (temp file) over $1 atomically, keeping $1's owner and mode.
+replace_file() {
+  local file=$1 tmp=$2
+  chmod --reference="$file" "$tmp"
+  real_system && chown --reference="$file" "$tmp"
+  mv -f "$tmp" "$file"
+}
 
-# Built beforehand as the normal user: root usually has no cargo, and building
-# as root would leave root-owned files in your target/ directory.
-BUILT="$HOST_DIR/target/release/microbit-authenticator"
-if [[ ! -x "$BUILT" ]]; then
-  echo "error: $BUILT not found — build it first (as your user):" >&2
-  echo "  (cd $HOST_DIR && cargo build --release)" >&2
-  exit 1
-fi
+# Our lines removed from $1, to stdout.
+without_our_lines() {
+  grep -vxF -e "$PAM_LINE" -e "$MARK" "$1" || true
+}
 
-echo "== install binary =="
-install -m 0755 -o root -g root "$BUILT" "$BIN"
+sudo_has_line() { grep -qxF "$PAM_LINE" "$SUDO_PAM"; }
 
-echo "== key store =="
-mkdir -p "$KEY_DIR"
-chmod 700 "$KEY_DIR"
-if [[ ! -f "$KEY_FILE" ]]; then
-  "$BIN" keygen --out "$KEY_FILE"
-  echo "generated root-only key: $KEY_FILE"
-else
-  echo "key file already exists (kept untouched): $KEY_FILE"
-fi
-chmod 600 "$KEY_FILE"
-chown root:root "$KEY_FILE"
-
-echo "== udev rule =="
-install -m 0644 "$SCRIPT_DIR/99-microbit-auth.rules" /etc/udev/rules.d/99-microbit-auth.rules
-udevadm control --reload-rules 2>/dev/null || true
-udevadm trigger 2>/dev/null || true
-
-if [[ $NO_PAM -eq 1 ]]; then
-  echo "== PAM: skipped (--no-pam) =="
-  PAM_FILES=()
-else
-  echo "== PAM =="
-fi
-for pam in "${PAM_FILES[@]+"${PAM_FILES[@]}"}"; do
-  [[ -f "$pam" ]] || { echo "skip (not present): $pam"; continue; }
-  cp -a "$pam" "${pam}${BACKUP_SUFFIX}"
-  if grep -qF "$PAM_LINE" "$pam"; then
-    echo "PAM line already present: $pam"
-  else
-    sed -i "1i$PAM_LINE" "$pam"
-    echo "inserted at top (auth runs first): $pam  [backup: ${pam}${BACKUP_SUFFIX}]"
+sudo_add() {
+  [[ -f "$SUDO_PAM" ]] || die "$SUDO_PAM not found"
+  if sudo_has_line; then
+    echo "already enabled in $SUDO_PAM"
+    return
   fi
-done
+  [[ -e "$BACKUP" ]] || cp -a "$SUDO_PAM" "$BACKUP" # first original only
 
-if [[ $NO_PAM -eq 1 ]]; then
-  PAM_SUMMARY="not touched (--no-pam)"
-else
-  PAM_SUMMARY="sufficient pam_exec.so at top of /etc/pam.d/sddm [and kde]"
-fi
+  local tmp
+  tmp="$(mktemp "$SUDO_PAM.XXXXXX")"
+  # Insert our two lines right before the first `auth` line.
+  if ! awk -v mark="$MARK" -v line="$PAM_LINE" '
+      !done && /^[[:space:]]*auth[[:space:]]/ { print mark; print line; done = 1 }
+      { print }
+      END { if (!done) exit 3 }' "$SUDO_PAM" >"$tmp"; then
+    rm -f "$tmp"
+    die "no 'auth' line in $SUDO_PAM — not touching it"
+  fi
+  # Paranoia: apart from our lines, the new file must equal the old one.
+  if ! diff -q <(without_our_lines "$tmp") "$SUDO_PAM" >/dev/null; then
+    rm -f "$tmp"
+    die "sanity check failed — $SUDO_PAM left unchanged"
+  fi
+  replace_file "$SUDO_PAM" "$tmp"
+  echo "enabled: added 2 lines to $SUDO_PAM (original saved as $BACKUP)"
+}
 
-cat <<EOF
+sudo_remove() {
+  [[ -f "$SUDO_PAM" ]] || return 0
+  if ! sudo_has_line && ! grep -qxF "$MARK" "$SUDO_PAM"; then
+    echo "not enabled in $SUDO_PAM (nothing to remove)"
+    return
+  fi
+  local tmp
+  tmp="$(mktemp "$SUDO_PAM.XXXXXX")"
+  without_our_lines "$SUDO_PAM" >"$tmp"
+  if ! grep -qE '^[[:space:]]*auth[[:space:]]' "$tmp"; then
+    rm -f "$tmp"
+    die "result would have no auth line — $SUDO_PAM left unchanged"
+  fi
+  replace_file "$SUDO_PAM" "$tmp"
+  echo "disabled: removed our lines from $SUDO_PAM"
+}
 
-== deployed ==
-  binary : $BIN
-  key    : $KEY_FILE (root:root 0600)
-  udev   : /etc/udev/rules.d/99-microbit-auth.rules -> /dev/microbit-auth
-  pam    : $PAM_SUMMARY
+# ── commands ──────────────────────────────────────────────────────────────
 
-== next steps (board side) ==
-  1) flash firmware:  cd $REPO_ROOT/src/12-authenticate
-                      cargo embed --release --target thumbv7em-none-eabihf
-  2) provision key:   sudo $BIN provision          (uses $KEY_FILE)
-  3) button check:    $BIN btn-test                (press Button A when LED waits)
-  4) end-to-end:      loginctl lock-session        -> press A = instant unlock, ignore = password
+cmd_install() {
+  local built="$HOST_DIR/target/release/microbit-authenticator"
+  [[ -x "$built" ]] || die "$built not found — build it first, as your user:
+  (cd $HOST_DIR && cargo build --release)"
 
-== recovery ==
-  sudo $BIN  provision again -> re-flash first (see module README for APPROTECT unlock)
+  echo "== binary =="
+  mkdir -p "$(dirname "$BIN")"
+  if real_system; then
+    install -m 0755 -o root -g root "$built" "$BIN"
+  else
+    install -m 0755 "$built" "$BIN"
+  fi
+  echo "installed $BIN"
+
+  echo "== key =="
+  mkdir -p "$KEY_DIR"
+  chmod 700 "$KEY_DIR"
+  if [[ -f "$KEY_FILE" ]]; then
+    echo "kept existing $KEY_FILE"
+  else
+    "$BIN" keygen --out "$KEY_FILE" >/dev/null 2>&1
+    echo "generated new key $KEY_FILE"
+  fi
+  chmod 600 "$KEY_FILE"
+  real_system && chown root:root "$KEY_FILE" "$KEY_DIR"
+
+  echo "== udev rule (stable /dev/microbit-auth name) =="
+  mkdir -p "$(dirname "$UDEV_RULE")"
+  install -m 0644 "$SCRIPT_DIR/99-microbit-auth.rules" "$UDEV_RULE"
+  if real_system; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=tty 2>/dev/null || true
+  fi
+  echo "installed $UDEV_RULE"
+
+  echo "== test PAM service (button only, sudo untouched) =="
+  mkdir -p "$(dirname "$TEST_PAM")"
+  cat >"$TEST_PAM" <<EOF
+#%PAM-1.0
+# Button-only test service for microbit-authenticator. Nothing uses it except
+# you, testing:   sudo pamtester microbit-test \$USER authenticate
+$PAM_LINE
+auth       required     pam_deny.so
+account    required     pam_permit.so
 EOF
+  chmod 644 "$TEST_PAM"
+  echo "installed $TEST_PAM"
+
+  cat <<EOF
+
+Done. /etc/pam.d/sudo was NOT touched. Next:
+  1) put the key on the board:  sudo $BIN_PATH provision --no-lock
+  2) try the test service:      sudo pamtester microbit-test \$USER authenticate
+                                (pamtester is in the AUR; press A -> "successfully authenticated")
+  3) when happy:                sudo $0 enable-sudo
+EOF
+}
+
+cmd_enable_sudo() {
+  [[ -x "$BIN" ]] || die "run '$0 install' first"
+  [[ -f "$KEY_FILE" ]] || die "no key file $KEY_FILE — run '$0 install' first"
+  real_system && { [[ -f /usr/lib/security/pam_exec.so ]] || die "pam_exec.so not found"; }
+
+  if [[ "${2:-}" != "--yes" ]]; then
+    cat <<EOF
+This adds 2 lines to $SUDO_PAM:
+  $MARK
+  $PAM_LINE
+
+Before continuing, open a SECOND terminal and run 'sudo -i' there, and keep
+it open until you've checked sudo still works ('sudo -k; sudo true').
+Undo at any time: sudo $0 disable-sudo   (or copy back $BACKUP)
+
+EOF
+    read -r -p "Type 'yes' to continue: " answer
+    [[ "$answer" == "yes" ]] || die "aborted, nothing changed"
+  fi
+  sudo_add
+  cat <<EOF
+
+Test now (in a normal terminal):
+  sudo -k; sudo true       -> board blinks: press A = root, wait 5 s = password
+EOF
+}
+
+cmd_status() {
+  local ok="yes" no="no"
+  echo "binary        : $([[ -x "$BIN" ]] && echo "$ok ($BIN)" || echo $no)"
+  echo "key file      : $([[ -f "$KEY_FILE" ]] && echo "$ok ($(stat -c '%U:%G %a' "$KEY_FILE"))" || echo $no)"
+  echo "udev rule     : $([[ -f "$UDEV_RULE" ]] && echo $ok || echo $no)"
+  echo "board symlink : $([[ -e "$R/dev/microbit-auth" ]] && echo "$ok (/dev/microbit-auth)" || echo "$no (plugged in? udev rule installed?)")"
+  echo "test service  : $([[ -f "$TEST_PAM" ]] && echo $ok || echo $no)"
+  echo "sudo enabled  : $([[ -f "$SUDO_PAM" ]] && sudo_has_line && echo $ok || echo $no)"
+}
+
+cmd_uninstall() {
+  sudo_remove
+  rm -f "$TEST_PAM" "$UDEV_RULE" "$BIN" "$R$LOG_PATH"
+  real_system && udevadm control --reload-rules 2>/dev/null || true
+  echo "removed: test service, udev rule, binary, log"
+  echo "kept:    $KEY_DIR (delete with: sudo rm -rf $KEY_DIR)"
+  [[ -e "$BACKUP" ]] && echo "kept:    $BACKUP (original sudo file, for reference)"
+  return 0
+}
+
+case "${1:-install}" in
+  install) cmd_install ;;
+  enable-sudo) cmd_enable_sudo "$@" ;;
+  disable-sudo) sudo_remove ;;
+  status) cmd_status ;;
+  uninstall) cmd_uninstall ;;
+  *) die "unknown command '${1}' (install | status | enable-sudo | disable-sudo | uninstall)" ;;
+esac

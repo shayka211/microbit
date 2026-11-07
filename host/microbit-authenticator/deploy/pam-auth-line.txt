@@ -1,4 +1,6 @@
-auth sufficient pam_exec.so quiet log=/var/log/microbit-auth.log /usr/local/bin/microbit-authenticator auth
-# ^ insert at the TOP of the `auth` section in /etc/pam.d/sddm (and /etc/pam.d/kde
-#   for the KDE lock screen). `sufficient` = success → log in immediately;
-#   failure → fall through to the normal password prompt.
+auth       sufficient   pam_exec.so quiet stdout seteuid log=/var/log/microbit-auth.log /usr/local/bin/microbit-authenticator auth
+# ^ added by `deploy/install.sh enable-sudo` right above `auth include system-auth`
+#   in /etc/pam.d/sudo. `sufficient` = button pressed → root immediately;
+#   anything else → the normal password prompt. `seteuid` is required (the
+#   helper must run as root to read /etc/microbit-auth/secret.key); `stdout`
+#   shows the "press button A" line in your terminal.
