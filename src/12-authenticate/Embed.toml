@@ -9,7 +9,7 @@ halt_afterwards = false
 # RTT is enabled so `cargo embed` decodes and prints defmt logs live
 # (requires -Tdefmt.x in .cargo/config.toml so the binary carries the
 # .defmt section). This is how you SEE the firmware working.
-enabled = true
+enabled = false
 
 [default.gdb]
 enabled = false

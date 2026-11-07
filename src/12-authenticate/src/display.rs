@@ -1,7 +1,6 @@
 //! 5×5 LED-matrix display task (row-anode / col-cathode polarity).
 
-use crate::logger::flush;
-use crate::logger::Level as LogLevel;
+use embassy_futures::select::{select, Either};
 use embassy_nrf::gpio::{AnyPin, Level, Output, OutputDrive};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -81,8 +80,17 @@ fn frame_for(pattern: Pattern, blink: bool) -> [[u8; 5]; 5] {
     f
 }
 
+/// Returns true when every LED in the frame is off.
+fn frame_is_empty(frame: &[[u8; 5]; 5]) -> bool {
+    frame.iter().all(|row| row.iter().all(|&led| led == 0))
+}
+
 /// Row-scanning multiplexer. Runs forever; picks up `Pattern` updates from the
 /// channel whenever one is queued.
+///
+/// When the current frame has no lit LEDs (e.g. Idle, or the off-phase of a
+/// blinking pattern) the task blocks on the pattern channel instead of
+/// row-scanning, so the CPU can enter deep sleep.
 #[embassy_executor::task]
 pub async fn task(
     patterns: &'static Channel<CriticalSectionRawMutex, Pattern, 8>,
@@ -90,6 +98,10 @@ pub async fn task(
     mut rows: [Output<'static, AnyPin>; 5],
 ) {
     const SCAN: Duration = Duration::from_micros(1_000);
+    /// Full-frame period used when the frame is empty — blink phase changes
+    /// happen at most once per frame anyway.
+    const FRAME: Duration = Duration::from_millis(5);
+
     let mut pattern = Pattern::Idle;
     let mut frame_count = 0u32;
     let mut blink = false;
@@ -101,27 +113,39 @@ pub async fn task(
             blink = !blink;
         }
         if let Ok(p) = patterns.try_receive() {
-            if p != pattern {
-                flush(LogLevel::Debug, format_args!("display: pattern -> {p:?}"));
-                pattern = p;
-            }
+            pattern = p;
         }
         let frame = frame_for(pattern, blink);
 
-        for row in 0..5 {
-            rows[row].set_high();
-            for col in 0..5 {
-                if frame[row][col] != 0 {
-                    cols[col].set_low();
-                } else {
-                    cols[col].set_high();
+        if frame_is_empty(&frame) {
+            // Nothing to light — block until a new pattern arrives, or the
+            // next frame boundary (so blink phases are still detected).
+            match select(patterns.receive(), Timer::after(FRAME)).await {
+                Either::First(p) => {
+                    pattern = p;
+                }
+                Either::Second(()) => {
+                    // Frame period elapsed — loop back to update blink phase
+                    // and check for new patterns.
                 }
             }
-            Timer::after(SCAN).await;
-            for c in cols.iter_mut() {
-                c.set_high();
+        } else {
+            // At least one LED is lit — full row-scan.
+            for row in 0..5 {
+                rows[row].set_high();
+                for col in 0..5 {
+                    if frame[row][col] != 0 {
+                        cols[col].set_low();
+                    } else {
+                        cols[col].set_high();
+                    }
+                }
+                Timer::after(SCAN).await;
+                for c in cols.iter_mut() {
+                    c.set_high();
+                }
+                rows[row].set_low();
             }
-            rows[row].set_low();
         }
     }
 }

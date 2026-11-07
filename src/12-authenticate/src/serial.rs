@@ -1,51 +1,23 @@
-//! UARTE0 serial transport on the DAPLink bridge (P0.06 TX / P1.08 RX, 115200).
+//! UARTE0 serial *reader* — owns the RX half only.
+//! TX is owned by the logger task (`logger::task`).
 
-use crate::logger::{flush, Level};
 use authenticate::constants::MAX_FRAME_LEN;
 use embassy_nrf::peripherals::UARTE0;
-use embassy_nrf::uarte::{Uarte, UarteRx, UarteTx};
-
-/// Render a protocol line byte-slice as a printable ASCII string for logging.
-/// Non-printable bytes become `·`.
-fn render_line(line: &[u8]) -> heapless::String<MAX_FRAME_LEN> {
-    let mut s = heapless::String::new();
-    for &b in line {
-        let c = if b.is_ascii_graphic() || b == b' ' {
-            b as char
-        } else {
-            '·'
-        };
-        let _ = s.push(c);
-    }
-    s
-}
+use embassy_nrf::uarte::UarteRx;
 
 pub struct Serial {
-    tx: UarteTx<'static, UARTE0>,
     rx: UarteRx<'static, UARTE0>,
     line: [u8; MAX_FRAME_LEN],
     len: usize,
 }
 
 impl Serial {
-    pub fn new(uarte: Uarte<'static, UARTE0>) -> Self {
-        let (tx, rx) = uarte.split();
+    pub fn new(rx: UarteRx<'static, UARTE0>) -> Self {
         Self {
-            tx,
             rx,
             line: [0u8; MAX_FRAME_LEN],
             len: 0,
         }
-    }
-
-    /// Write one protocol line (data + `\r\n`).
-    pub async fn write_line(&mut self, data: &[u8]) {
-        flush(
-            Level::Debug,
-            format_args!("serial tx: {}", render_line(data)),
-        );
-        let _ = self.tx.write(data).await;
-        let _ = self.tx.write(b"\r\n").await;
     }
 
     /// Read one CR/LF-terminated line. Overlong lines are dropped wholesale.
@@ -62,13 +34,6 @@ impl Serial {
                     if self.line[self.len - 1] == b'\r' {
                         self.len -= 1;
                     }
-                    flush(
-                        Level::Debug,
-                        format_args!(
-                            "serial rx: {}",
-                            render_line(&self.line[..self.len])
-                        ),
-                    );
                     return Ok(&self.line[..self.len]);
                 }
                 b'\r' => {} // dropped
@@ -77,7 +42,6 @@ impl Serial {
                     self.len += 1;
                 }
                 _ => {
-                    flush(Level::Warn, format_args!("serial rx: line overflow, dropping"));
                     self.len = 0; // overflow: drop the whole line
                 }
             }

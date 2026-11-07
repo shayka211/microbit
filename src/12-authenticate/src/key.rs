@@ -10,7 +10,6 @@ use cortex_m::peripheral::SCB;
 use nrf52833_pac as pac;
 use pac::{nvmc, NVMC};
 
-use crate::logger::{flush, Level};
 use authenticate::constants::{UICR_APPROTECT_ADDR, UICR_KEY_BASE, UICR_MAGIC, UICR_MAGIC_ADDR};
 
 fn regs() -> &'static nvmc::RegisterBlock {
@@ -25,13 +24,8 @@ fn wait_ready() {
 pub fn load_key() -> Option<[u8; 32]> {
     let magic = unsafe { ptr::read_volatile(UICR_MAGIC_ADDR as *const u32) };
     if magic != UICR_MAGIC {
-        flush(
-            Level::Debug,
-            format_args!("uicr: no key (magic {:#010x} != {:#010x})", magic, UICR_MAGIC),
-        );
         return None;
     }
-    flush(Level::Debug, format_args!("uicr: key present (magic ok)"));
     let mut key = [0u8; 32];
     for (i, chunk) in key.chunks_exact_mut(4).enumerate() {
         let word = unsafe { ptr::read_volatile((UICR_KEY_BASE + (i as u32) * 4) as *const u32) };
@@ -47,7 +41,6 @@ pub enum KeyError {
 
 /// Erase the whole UICR page (needed before writing new bits).
 fn erase_uicr() {
-    flush(Level::Info, format_args!("uicr: erase page"));
     let r = regs();
     r.config.write(|w| w.wen().een()); // erase-page mode
     wait_ready();
@@ -59,7 +52,6 @@ fn erase_uicr() {
 
 /// Flash a new key (plus magic word) into UICR and verify by read-back.
 pub fn provision(key: &[u8; 32]) -> Result<(), KeyError> {
-    flush(Level::Info, format_args!("uicr: write 32-byte key + magic"));
     erase_uicr();
 
     let r = regs();
@@ -78,10 +70,8 @@ pub fn provision(key: &[u8; 32]) -> Result<(), KeyError> {
     wait_ready();
 
     if load_key().as_ref() != Some(key) {
-        flush(Level::Error, format_args!("uicr: readback mismatch -> provision failed"));
         return Err(KeyError::ReadbackFail);
     }
-    flush(Level::Info, format_args!("uicr: readback verified, provision ok"));
     Ok(())
 }
 
@@ -89,10 +79,6 @@ pub fn provision(key: &[u8; 32]) -> Result<(), KeyError> {
 /// Takes effect after the next reset. From then on SWD can't read flash/RAM/UICR
 /// (the key becomes unrecoverable — by design). Unlock = full chip erase.
 pub fn enable_readback_protection() {
-    flush(
-        Level::Info,
-        format_args!("uicr: APPROTECT=0 (readback protection, locks after reset)"),
-    );
     let r = regs();
     r.config.write(|w| w.wen().wen());
     wait_ready();
@@ -105,6 +91,5 @@ pub fn enable_readback_protection() {
 
 /// Hard system reset (required for APPROTECT to become active).
 pub fn reset_chip() -> ! {
-    flush(Level::Info, format_args!("uicr: system reset"));
     SCB::sys_reset()
 }

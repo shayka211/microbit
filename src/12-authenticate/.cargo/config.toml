@@ -1,10 +1,9 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 rustflags = [
   "-C", "link-arg=-Tlink.x",
-  # defmt.x collects all the `.defmt.*` sections into the single `.defmt`
-  # section that probe-rs needs to decode the log messages. Without it the
-  # firmware runs fine but *no* defmt output is visible (probe-rs reports
-  # "no .defmt section") — that's why logs appear missing after flashing.
+  # defmt.x collects `.defmt.*` sections into `.defmt` — needed by the
+  # on‑device tests (defmt-test).  Harmless for the main firmware binary
+  # because embassy is compiled without the `defmt` feature.
   "-C", "link-arg=-Tdefmt.x",
 ]
 

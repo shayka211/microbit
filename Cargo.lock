@@ -30,6 +30,7 @@ dependencies = [
  "microbit 0.12.0",
  "microbit-v2 0.12.0",
  "nrf52833-pac 0.12.2",
+ "panic-halt",
  "panic-probe",
  "sha2",
 ]
@@ -320,7 +321,6 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eca4a9380d03e61063067b8239f67d2fa9f108ede7c46b4273804f6b79e59a1d"
 dependencies = [
- "defmt 0.3.101",
  "embassy-futures",
  "embassy-sync",
  "embassy-time",
@@ -340,7 +340,6 @@ checksum = "a3d8701436bf0dc453703175459805045d049bf7404df7a68e59d05c7fbd1f04"
 dependencies = [
  "cortex-m",
  "critical-section",
- "defmt 0.3.101",
  "document-features",
  "embassy-executor-macros",
  "embassy-time-driver",
@@ -373,7 +372,6 @@ checksum = "a0ec47cf8bab914018d4bd2b4f0aaeb46e4f52ab1e7985df88aeef2c6eda5aed"
 dependencies = [
  "cortex-m",
  "critical-section",
- "defmt 0.3.101",
  "num-traits",
 ]
 
@@ -387,7 +385,6 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "critical-section",
- "defmt 0.3.101",
  "document-features",
  "embassy-embedded-hal",
  "embassy-hal-internal",
@@ -423,7 +420,6 @@ checksum = "dd938f25c0798db4280fcd8026bf4c2f48789aebf8f77b6e5cf8a7693ba114ec"
 dependencies = [
  "cfg-if",
  "critical-section",
- "defmt 0.3.101",
  "embedded-io-async",
  "futures-util",
  "heapless 0.8.0",
@@ -437,7 +433,6 @@ checksum = "158080d48f824fad101d7b2fae2d83ac39e3f7a6fa01811034f7ab8ffc6e7309"
 dependencies = [
  "cfg-if",
  "critical-section",
- "defmt 0.3.101",
  "document-features",
  "embassy-time-driver",
  "embassy-time-queue-driver",
@@ -469,7 +464,6 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "340c5ce591ef58c6449e43f51d2c53efe1bf0bb6a40cbf80afa0d259c7d52c76"
 dependencies = [
- "defmt 1.2.0",
  "embedded-io-async",
 ]
 
