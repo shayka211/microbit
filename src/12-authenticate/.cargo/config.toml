@@ -1,10 +1,6 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 rustflags = [
   "-C", "link-arg=-Tlink.x",
-  # defmt.x collects `.defmt.*` sections into `.defmt` — needed by the
-  # on‑device tests (defmt-test).  Harmless for the main firmware binary
-  # because embassy is compiled without the `defmt` feature.
-  "-C", "link-arg=-Tdefmt.x",
 ]
 
 # On-target tests (defmt-test): `cargo test --target thumbv7em-none-eabihf --test ondevice`

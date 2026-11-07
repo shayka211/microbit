@@ -22,6 +22,14 @@ fn main() {
         .unwrap();
     println!("cargo:rustc-link-search={}", out.display());
 
+    // defmt linker script — only needed when defmt is in the dependency
+    // graph (i.e. when building the on‑device test binary).  The defmt
+    // crate sets `DEP_DEFMT_*` env vars via its build script; we only
+    // emit `-Tdefmt.x` when those vars exist.
+    if std::env::var("DEP_DEFMT_OUT_DIR").is_ok() {
+        println!("cargo:rustc-link-arg=-Tdefmt.x");
+    }
+
     // By default, Cargo will re-run a build script whenever
     // any file in the project changes. By specifying `memory.x`
     // here, we ensure the build script is only re-run when
